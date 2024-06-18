@@ -1,0 +1,2 @@
+qsb --qt6 --o vert.qsb shader.vert
+qsb --qt6 --o frag.qsb shader.frag
