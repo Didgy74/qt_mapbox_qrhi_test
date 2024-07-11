@@ -4,38 +4,44 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-include(FetchContent)
-
-# Specify the repository and the tag/commit/branch you want to fetch
-FetchContent_Declare(
-  CDT
-  GIT_REPOSITORY https://github.com/artem-ogre/CDT.git
-  GIT_TAG master  # You can specify a specific commit, tag, or branch here
-)
-
-# Fetch the content
-FetchContent_MakeAvailable(CDT)
-
-# Add the CDT library as a subdirectory
-add_subdirectory(${cdt_SOURCE_DIR}/CDT ${cdt_BINARY_DIR})
-
 find_package(Qt6 REQUIRED COMPONENTS
     Core
     Gui
     Qml
     Quick
-    ShaderTools
-    Protobuf
-    ProtobufTools)
-
+    ShaderTools)
 qt_standard_project_setup()
+
+include(FetchContent)
+
+# This library might be problematic because it may throw
+# exceptions
+FetchContent_Declare(
+  CDT
+  GIT_REPOSITORY https://github.com/artem-ogre/CDT.git
+  GIT_TAG master
+)
+FetchContent_MakeAvailable(CDT)
+
+add_subdirectory(${cdt_SOURCE_DIR}/CDT ${cdt_BINARY_DIR})
+
+FetchContent_Declare(
+  glm
+  GIT_REPOSITORY https://github.com/g-truc/glm.git
+  GIT_TAG master
+)
+FetchContent_MakeAvailable(glm)
+
+find_package(protobuf CONFIG REQUIRED)
 
 qt_add_executable(qt_map_hw WIN32 MACOSX_BUNDLE
     main.cpp
     qquickmap.cpp qquickmap.h
     Evaluator.h Evaluator.cpp
     LayerStyle.h LayerStyle.cpp
+    tileloader.h tileloader.cpp
     MapboxGeometryDecoding.h MapboxGeometryDecoding.cpp
+    vector_tile.pb.h vector_tile.pb.cc
 )
 
 target_link_libraries(qt_map_hw PUBLIC
@@ -43,9 +49,15 @@ target_link_libraries(qt_map_hw PUBLIC
     Qt6::GuiPrivate
     Qt6::Qml
     Qt6::Quick
-    Qt6::Protobuf
-    CDT
 )
+
+target_link_libraries(qt_map_hw PUBLIC
+    CDT
+    glm
+    protobuf::libprotobuf protobuf::libprotoc protobuf::libprotobuf-lite
+)
+
+#target_include_directories(qt_map_hw PUBLIC external/protobuf)
 
 qt_add_qml_module(qt_map_hw
     URI MyQmlApp
@@ -65,16 +77,16 @@ qt6_add_shaders(qt_map_hw "shaders"
     "shaders/background.frag"
 )
 
-qt_add_protobuf(qt_map_hw
-    PROTO_FILES
-    vector_tile.proto
-)
+#qt_add_protobuf(qt_map_hw
+#    PROTO_FILES
+#    vector_tile.proto
+#)
 
 qt_add_resources(qt_map_hw "externalResources"
     PREFIX "/"
     FILES
-    z0x0y0.mvt
-    styleSheet.json
+    styleSheet-basic.json
+    styleSheet-bright.json
 )
 
 install(TARGETS qt_map_hw
@@ -108,3 +120,22 @@ function(deploy_runtime_dependencies_if_win32 target)
     endif()
 endfunction()
 deploy_runtime_dependencies_if_win32(qt_map_hw)
+
+
+# If on Android, the MapTiler key must be supplied through the
+# MAPTILER_KEY variable.
+if(ANDROID)
+    if(NOT DEFINED MAPTILER_KEY OR "${MAPTILER_KEY}" STREQUAL "" OR "${MAPTILER_KEY}" STREQUAL "<UNSET>")
+        message(FATAL_ERROR "No MapTiler key set.")
+    endif()
+    target_compile_definitions(qt_map_hw PUBLIC MAPTILER_KEY="${MAPTILER_KEY}")
+
+    # Now link OpenSSL to enable networking.
+    if (NOT DEFINED ANDROID_SDK_ROOT)
+        message(FATAL_ERROR "Error. No ANDROID SDK_ROOT variable set.")
+    endif()
+    set(android_openssl_SOURCE_DIR "${ANDROID_SDK_ROOT}/android_openssl")
+    include(${android_openssl_SOURCE_DIR}/android_openssl.cmake)
+
+    add_android_openssl_libraries(qt_map_hw)
+endif()

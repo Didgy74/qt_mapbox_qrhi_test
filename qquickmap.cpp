@@ -4,20 +4,22 @@
 #include <QQuickWindow>
 #include <QSGImageNode>
 #include <QSGRenderNode>
-#include <QProtobufSerializer>
 #include <rhi/qrhi.h>
 #include <QPainterPath>
 #include <QScopeGuard>
 #include <QSpan>
 
+#include <glm/glm.hpp>
+#include <glm/mat4x4.hpp>
+#include <glm/ext/matrix_transform.hpp> // glm::translate, glm::rotate, glm::scale
+
 #include <LayerStyle.h>
 #include "Evaluator.h"
-#include "MapboxGeometryDecoding.h"
 
 #include <memory>
 #include <optional>
 
-#include "vector_tile.qpb.h"
+#include <QSGTextNode>
 
 namespace Bach {
     // Temporary, not gonna need it in the future.
@@ -36,51 +38,84 @@ namespace Bach {
     }
 }
 
-std::map<QString, QVariant> populateFeatureMetaData(
-    QSpan<unsigned int const> tags,
-    QSpan<QString const> keys,
-    QSpan<vector_tile::Tile_QtProtobufNested::Value const> values)
+static int calcMapZoomLevelForTileSizePixels(
+    int vpWidth,
+    int vpHeight,
+    double vpZoom,
+    int desiredTileWidth)
 {
-    //The feature's keys list is the features metadata encoded using the tile's values list.
-    //The kayes list length is always expected to be even.
-    //the nth element in the keys list corresponds to the (n/2)th element in the metadata map after decoding,
-    // and the n+1 th element in the keys list correspond to the value for the (n/2) element in the metadata map after decoding.
-    //The keys elements' values map to the tile values list's indecies.
-    if (tags.size() < 2) {
-        qFatal("Incorrect tag count");
-        return {};
-    }
+    // Calculate current tile size based on the largest dimension and current scale
+    int currentTileSize = qMax(vpWidth, vpHeight);
 
+    // Calculate desired scale factor
+    double desiredScale = (double)desiredTileWidth / currentTileSize;
 
-    std::map<QString, QVariant> returnData;
+    // Figure out how the difference between the zoom levels of viewport and map
+    // needed to satisfy the pixel-size requirement.
+    double newMapZoomLevel = vpZoom - log2(desiredScale);
 
-    for(int i = 0; i <= tags.size() - 2; i += 2){
-        int keyIndex = tags[i];
-        int valueIndex = tags[i + 1];
-        auto const& key = keys[keyIndex];
-
-        auto const& value = values[valueIndex];
-
-        if (value.hasStringValue()) {
-            returnData.insert({key, QVariant(value.stringValue())});
-        } else if (value.hasFloatValue()) {
-            returnData.insert({key, QVariant(value.floatValue())});
-        } else if (value.hasDoubleValue()) {
-            returnData.insert({key, QVariant(value.doubleValue())});
-        } else if (value.hasIntValue()) {
-            returnData.insert({key, QVariant::fromValue<QtProtobuf::int64>(value.intValue())});
-        } else if (value.hasUintValue()) {
-            returnData.insert({key, QVariant::fromValue<QtProtobuf::uint64>(value.uintValue())});
-        } else if (value.hasSintValue()) {
-            returnData.insert({key, QVariant::fromValue<QtProtobuf::sint64>(value.sintValue())});
-        } else if (value.hasBoolValue()) {
-            returnData.insert({key, QVariant(value.boolValue())});
-        }
-    }
-
-    return returnData;
+    // Round to int, and clamp output to zoom level range.
+    return (int)round(newMapZoomLevel);
 }
 
+std::pair<double, double> calcViewportSizeNorm(double vpZoomLevel, double viewportAspect) {
+    auto temp = 1 / pow(2, vpZoomLevel);
+    return {
+        temp * qMin(1.0, viewportAspect),
+        temp * qMin(1.0, 1 / viewportAspect)
+    };
+}
+
+std::vector<TileCoord> calcVisibleTiles(
+    double vpX,
+    double vpY,
+    double vpAspect,
+    double vpZoomLevel,
+    int mapZoomLevel)
+{
+    mapZoomLevel = qMax(0, mapZoomLevel);
+
+    // We need to calculate the width and height of the viewport in terms of
+    // world-normalized coordinates.
+    auto [vpWidthNorm, vpHeightNorm] = calcViewportSizeNorm(vpZoomLevel, vpAspect);
+
+    // Figure out the 4 edges in world-normalized coordinate space.
+    auto vpMinNormX = vpX - (vpWidthNorm / 2.0);
+    auto vpMaxNormX = vpX + (vpWidthNorm / 2.0);
+    auto vpMinNormY = vpY - (vpHeightNorm / 2.0);
+    auto vpMaxNormY = vpY + (vpHeightNorm / 2.0);
+
+    // Amount of tiles in each direction for this map zoom level.
+    auto tileCount = 1 << mapZoomLevel;
+
+    auto clampToGrid = [&](int i) {
+        return std::clamp(i, 0, tileCount-1);
+    };
+
+    // Convert edges into the index-based grid coordinates, and apply a clamp operation
+    // in case the viewport goes outside the map.
+    auto leftTileX = clampToGrid((int)floor(vpMinNormX * tileCount));
+    auto rightTileX = clampToGrid((int)floor(vpMaxNormX * tileCount));
+    auto topTileY = clampToGrid((int)floor(vpMinNormY * tileCount));
+    auto botTileY = clampToGrid((int)floor(vpMaxNormY * tileCount));
+
+    // Iterate over our two ranges to build our list.
+
+    if (mapZoomLevel == 0 &&
+        rightTileX - leftTileX == 0 &&
+        botTileY - topTileY == 0)
+    {
+        return { { 0, 0, 0 } };
+    } else {
+        std::vector<TileCoord> visibleTiles;
+        for (int y = topTileY; y <= botTileY; y++) {
+            for (int x = leftTileX; x <= rightTileX; x++) {
+                visibleTiles.push_back({ mapZoomLevel, x, y });
+            }
+        }
+        return visibleTiles;
+    }
+}
 
 static bool isLayerShown(const StyleSheet::AbstractLayerStyle &layerStyle, int mapZoom)
 {
@@ -92,6 +127,7 @@ static bool isLayerShown(const StyleSheet::AbstractLayerStyle &layerStyle, int m
 
 static bool showFeature(
     StyleSheet::AbstractLayerStyle const& layerStyle,
+    Evaluator::FeatureGeometryType featureGeomType,
     std::map<QString, QVariant> const& featureMetaData,
     int mapZoom,
     double vpZoom)
@@ -100,156 +136,11 @@ static bool showFeature(
         return true;
     return Evaluator::resolveExpression(
        layerStyle.m_filter,
+       featureGeomType,
        featureMetaData,
        mapZoom,
        vpZoom).toBool();
 }
-
-// Represents the position of a tile within the maps grid at a given zoom level.
-//
-// This is the C++ equivalent of the tile-position-triplet in the report.
-struct TileCoord {
-    /* Map zoom level of this tile's position. Range [0, 16].
-     */
-    int zoom = 0;
-
-    /* X direction index-coordinate of this tile.
-     *
-     * Should always be in the range [0, tilecount-1]
-     * where tilecount = 2^zoom
-     */
-    int x = 0;
-    /* Y direction index-coordinate of this tile.
-     *
-     * Should always be in the range [0, tilecount-1]
-     * where tilecount = 2^zoom
-     */
-    int y = 0;
-
-    QString toString() const;
-
-    // Define less-than operator, equality operator, and inequality
-    // operator in order to allow using this type as a key in QMap.
-    bool operator<(const TileCoord &other) const;
-    bool operator==(const TileCoord &other) const;
-    bool operator!=(const TileCoord &other) const;
-};
-
-/*!
- * \internal
- *
- * \brief The TileScreenPlacement struct describes a tile's
- * position and size within the viewport.
- */
-struct TileScreenPlacement {
-    double pixelPosX;
-    double pixelPosY;
-    double pixelWidth;
-};
-
-/*!
- * \internal
- *
- * \brief The TilePosCalculator class
- * is a helper class for positioning tiles within the viewport.
- */
-class TilePosCalculator {
-    double vpWidth;
-    double vpHeight;
-    double vpX;
-    double vpY;
-    double vpZoom;
-    int mapZoom;
-
-private:
-    // Largest dimension between viewport height and width, expressed in pixels.
-    double VpMaxDim() const { return qMax(vpWidth, vpHeight); }
-
-    // Aspect ratio of the viewport, as a scalar.
-    double VpAspect() const { return (double)vpWidth / (double)vpHeight; }
-
-    // The scale of the world map as a scalar fraction of the viewport.
-    // Example: A value of 2 means the world map can fit 2 viewports in X and Y directions.
-    double WorldmapScale() const { return pow(2, vpZoom); }
-
-    // Size of an individual tile as a fraction of the world map.
-    //
-    // Exmaple: A value of 0.5 means the tile takes up half the length of the world map
-    // in X and Y directions.
-    double TileSizeNorm() const { return WorldmapScale() / (1 << mapZoom); }
-
-public:
-    /*!
-     * \brief calcTileSizeData
-     * Calculates the on-screen position information of a specific tile.
-     *
-     * \param coord The cooardinates of the tile wanted.
-     * \return The TileScreenPlacement with the correct data.
-     */
-    TileScreenPlacement calcTileSizeData(TileCoord coord) const {
-        // Calculate where the top-left origin of the world map is relative to the viewport.
-        double worldOriginX = vpX * WorldmapScale() - 0.5;
-        double worldOriginY = vpY * WorldmapScale() - 0.5;
-
-        // Adjust the world such that our worldmap is still centered around our center-coordinate
-        // when the aspect ratio changes.
-        if (VpAspect() < 1.0) {
-            worldOriginX += -0.5 * VpAspect() + 0.5;
-        } else if (VpAspect() > 1.0) {
-            worldOriginY += -0.5 / VpAspect() + 0.5;
-        }
-
-        // The position of this tile expressed in world-normalized coordinates.
-        double posNormX = (coord.x * TileSizeNorm()) - worldOriginX;
-        double posNormY = (coord.y * TileSizeNorm()) - worldOriginY;
-
-        TileScreenPlacement out;
-        out.pixelPosX = posNormX * VpMaxDim();
-        out.pixelPosY = posNormY * VpMaxDim();
-
-        // Calculate the width of a tile as it's displayed on-screen.
-        // (Height is same as width, perfectly square)
-        out.pixelWidth = TileSizeNorm() * VpMaxDim();
-
-        return out;
-    }
-
-    /*!
-     * \internal
-     * \brief createTilePosCalculator constructs a TilePosCalculator
-     * object based on the current state of the viewport.
-     *
-     * \param vpWidth The width of the viewport in pixels on screen.
-     * \param vpHeight The height of the viewport in pixels on screen.
-     * \param vpX The center X coordinate of the viewport in
-     * world-normalized coordinates.
-     * \param vpY The center Y coordinate of the viewport in
-     * world-normalized coordinates.
-     * \param vpZoom The current zoom-level of the viewport.
-     * \param mapZoom The current zoom-level of the map.
-     * \return The TilePosCalculator object that can be used to
-     * position tiles correctly on-screen.
-     */
-    static TilePosCalculator create(
-        int vpWidth,
-        int vpHeight,
-        double vpX,
-        double vpY,
-        double vpZoom,
-        int mapZoom)
-    {
-        TilePosCalculator out;
-        out.vpWidth = vpWidth;
-        out.vpHeight = vpHeight;
-        out.vpX = vpX;
-        out.vpY = vpY;
-        out.vpZoom = vpZoom;
-        out.mapZoom = mapZoom;
-        return out;
-    }
-
-};
-
 
 // Empty default destructor
 QQuickMap::RhiStuffPimplT::~RhiStuffPimplT() {}
@@ -269,19 +160,29 @@ public:
 
     QRhiBuffer* m_uniformBuffer = nullptr;
     struct UniformType {
-        float tilePos[2] = { 0, 0 };
-        float _padding[2] = { 0, 0 };
+        float matrix[16] = {};
         float color[4] = { 0, 0, 0, 1.0 };
+
+        static constexpr int internalSize = 64 + 16;
         // Dynamic uniform buffers need stride to be multiple of
         // 256 bytes for now...
-        char _padding2[256 - 32] = {};
+        char _padding2[256 - 80] = {};
     };
+    static_assert(sizeof(UniformType) == 256);
+    static_assert(offsetof(UniformType, color) == 64);
+
     std::vector<UniformType> m_uniforms = {};
     class DrawCmd {
     public:
-        QRhiBuffer* vtxBuffer;
-        QRhiBuffer* idxBuffer;
-        int idxCount;
+        QRhiBuffer* vtxBuffer = {};
+        // The amount to offset into the vtx buffer in bytes.
+        qint64 vtxByteOffset = 0;
+
+        QRhiBuffer* idxBuffer = {};
+        // The amount to offset into the idx buffer in bytes.
+        qint64 idxByteOffset = 0;
+        // The amount of indices to draw.
+        qint64 idxCount = 0;
     };
     std::vector<DrawCmd> m_drawCmds = {};
 
@@ -300,39 +201,11 @@ public:
     };
     BackgroundRhiResources backgroundRhi = {};
 
-    bool loadedTile = false;
-
-    class Feature {
-    public:
-        // Eventually we do not need to store the
-        // actual vertices or the indices. Just the
-        // index count.
-        // To do: Make each feature act as a span into
-        // one big buffer for the entire layer.
-        //
-        // For now it's useful to store them long-term
-        // Because they need to live until they get batch-uploaded
-        // to the GPU.
-
-        QRhiBuffer* vertexBuffer = {};
-        std::vector<QVector2D> vertices;
-        QRhiBuffer* indexBuffer = {};
-        std::vector<qint32> indices;
-
-        // Nils: I think we should just store all key-values in the layer-level
-        // and only store tags for the features, and index into the relevant key-values.
-        std::map<QString, QVariant> metaData;
-    };
-
-    class Layer {
-    public:
-        QString name;
-        std::vector<Feature> features;
-    };
-
-    std::vector<Layer> m_layers;
-
     StyleSheet m_styleSheet;
+    bool loadedStyleSheet = false;
+
+    std::unique_ptr<TileLoaderUploadResult> tileLoaderUploadResult;
+    std::unique_ptr<TileLoaderRequestResult> tileLoaderRequestResult;
 
     explicit MyCustomRenderNode(QQuickWindow *window, QQuickMap* quickItem) :
         window{ window },
@@ -368,14 +241,25 @@ public:
     void loadFillShaderResourceBindingsLayout(QRhi* rhi);
     void loadFillShader(QRhi* rhi);
 
-    void loadTile(QRhi* rhi, QRhiResourceUpdateBatch* batch);
+    void loadStyleSheet();
 
-    void prepareDrawCommands();
+    void prepareDrawCommands(
+        TileLoader* tileLoader,
+        glm::mat4 const& clipSpaceCorrection);
 
     virtual void prepare() override {
+        QSGRenderNode::prepare();
+
 		auto* rhi = window->rhi();
 
         auto* batch = rhi->nextResourceUpdateBatch();
+
+        // If the TileLoader has any pending GPU uploads, do it here...
+        // TODO: This is another race condition pretty sure...
+        auto tileLoader = sourceWidget->getTileLoader();
+        // This function call is thread-safe.
+        auto* pendingTileUploads = tileLoader->uploadPendingTilesToRhi(rhi, batch);
+        tileLoaderUploadResult.reset(pendingTileUploads);
 
         if (backgroundRhi.pipeline == nullptr) {
             loadBackgroundShader(rhi);
@@ -390,27 +274,32 @@ public:
             shaderInitialized = true;
         }
 
-        if (!loadedTile)
+        if (!loadedStyleSheet)
         {
-            loadTile(rhi, batch);
-            loadedTile = true;
+            loadStyleSheet();
+            loadedStyleSheet = true;
         }
 
-        if (m_uniformBuffer == nullptr) {
-            prepareDrawCommands();
+        auto tempMat = rhi->clipSpaceCorrMatrix();
+        glm::mat4 clipSpaceCorrMatrix = {};
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                clipSpaceCorrMatrix[i][j] = tempMat(i, j);
+            }
+        }
+        // Needs to happen every frame. We prepare whatever draw calls we need.
+        prepareDrawCommands(tileLoader, clipSpaceCorrMatrix);
 
+
+
+        if (m_uniformBuffer == nullptr) {
             m_uniformBuffer = rhi->newBuffer(
                 QRhiBuffer::Dynamic, // Must always be dynamic when uniform buffer.
                 QRhiBuffer::UniformBuffer,
-                m_uniforms.size() * sizeof(m_uniforms[0]));
+                m_uniforms.size() * 256);
             if (!m_uniformBuffer->create()) {
                 qFatal() << "Failed to create uniform buffer";
             }
-            batch->updateDynamicBuffer(
-                m_uniformBuffer,
-                0,
-                m_uniforms.size() * sizeof(m_uniforms[0]),
-                m_uniforms.data());
 
             if (m_resourceBindings == nullptr) {
                 m_resourceBindings = rhi->newShaderResourceBindings();
@@ -420,13 +309,41 @@ public:
                         0,
                         QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage,
                         m_uniformBuffer,
-                        sizeof(m_uniforms[0]))
+                        UniformType::internalSize)
                 });
 
                 m_resourceBindings->create();
             }
+        } else {
+            // We have a uniform buffer, we need to check if it can fit the draw commands.
+            if (m_uniformBuffer->size() < m_uniforms.size() * 256) {
+                // TODO: There is a memory leak here.
+                m_uniformBuffer = rhi->newBuffer(
+                    QRhiBuffer::Dynamic, // Must always be dynamic when uniform buffer.
+                    QRhiBuffer::UniformBuffer,
+                    m_uniforms.size() * 256);
+                if (!m_uniformBuffer->create()) {
+                    qFatal() << "Failed to create uniform buffer";
+                }
 
+                // TODO: There is a memory leak here.
+                m_resourceBindings = rhi->newShaderResourceBindings();
+                m_resourceBindings->setBindings({
+                    QRhiShaderResourceBinding::uniformBufferWithDynamicOffset(
+                        0,
+                        QRhiShaderResourceBinding::VertexStage | QRhiShaderResourceBinding::FragmentStage,
+                        m_uniformBuffer,
+                        UniformType::internalSize)
+                });
+
+                m_resourceBindings->create();
+            }
         }
+        batch->updateDynamicBuffer(
+            m_uniformBuffer,
+            0,
+            m_uniforms.size() * 256,
+            m_uniforms.data());
 
         // Find a background layer
         {
@@ -458,89 +375,7 @@ public:
         commandBuffer()->resourceUpdate(batch);
     }
 
-    virtual void render(const QSGRenderNode::RenderState *state) override {
-        auto* cb = commandBuffer();
-
-        // The QQuickItem canvas has Y pointing down.
-        // The QRhi canvas is Y pointing up.
-        // We need to fix.
-
-        auto pixelRatio = renderTarget()->devicePixelRatio();
-        auto renderTargetSize = renderTarget()->pixelSize().toSizeF();
-
-        auto x = sourceWidget->x() * pixelRatio;
-        auto y = sourceWidget->y() * pixelRatio;
-        auto width = sourceWidget->width() * pixelRatio;
-        auto height = sourceWidget->height() * pixelRatio;
-        // Adjust Y coordinate to account for the inverted Y-axis
-        float invertedY = renderTargetSize.height() - (y + height);
-
-        // Use the adjusted Y coordinate for rendering
-        cb->setViewport({
-            (float)x,
-            (float)invertedY,
-            (float)width,
-            (float)height
-        });
-
-        {
-            // Render background
-            cb->setGraphicsPipeline(backgroundRhi.pipeline);
-            cb->setShaderResources();
-            cb->draw(4);
-        }
-
-		cb->setGraphicsPipeline(m_pipeline);
-
-        // TODO: WARNING! Pretty sure this is a race condition
-        // Should be uploaded during QQuickMap::updatePaintingNode instead
-        // I think
-        auto vpZoom = sourceWidget->getViewportZoom();
-        auto vpX = sourceWidget->getViewportX();
-        auto vpY = sourceWidget->getViewportY();
-
-        auto tilePosCalc = TilePosCalculator::create(
-            width,
-            height,
-            vpX,
-            1 - vpY,
-            vpZoom,
-            0);
-        auto tilePos = tilePosCalc.calcTileSizeData({0, 0, 0});
-
-        // Use the adjusted Y coordinate for rendering
-        cb->setViewport({
-            (float)(x + tilePos.pixelPosX),
-            (float)(invertedY + tilePos.pixelPosY),
-            (float)tilePos.pixelWidth,
-            (float)tilePos.pixelWidth
-        });
-        cb->setScissor(QRhiScissor{
-            (int)x,
-            (int)invertedY,
-            (int)width,
-            (int)height
-        });
-
-        for (int i = 0; i < m_drawCmds.size(); i++) {
-            auto const& drawCmd = m_drawCmds[i];
-
-            auto dynOffset = QRhiCommandBuffer::DynamicOffset(0, sizeof(UniformType) * i );
-            cb->setShaderResources(m_resourceBindings, 1, &dynOffset);
-
-            QRhiCommandBuffer::VertexInput vertexInputs[] = { { drawCmd.vtxBuffer, 0 } };
-
-            cb->setVertexInput(
-                0,
-                1,
-                vertexInputs,
-                drawCmd.idxBuffer,
-                0,
-                QRhiCommandBuffer::IndexUInt32);
-
-            cb->drawIndexed(drawCmd.idxCount, 1, 0, 0, 0);
-        }
-    }
+    virtual void render(const QSGRenderNode::RenderState *state) override;
 };
 
 QQuickMap::QQuickMap(QQuickItem* parent) : QQuickItem(parent) {
@@ -554,9 +389,96 @@ QSGNode* QQuickMap::updatePaintNode(QSGNode* oldNode, UpdatePaintNodeData*) {
     auto node = oldNode;
     if (oldNode == nullptr) {
         node = new MyCustomRenderNode(window(), this);
+        node->setFlag(QSGNode::OwnedByParent);
+
+        auto* textNode = window()->createTextNode();
+        textNode->setFlag(QSGNode::OwnedByParent);
+        node->appendChildNode(textNode);
+        QTextLayout textLayout;
+        QFont font("Arial", 24);
+        textLayout.setFont(font);
+        textLayout.setText("Hello, testing something out whatever");
+        //textNode->setViewport(boundingRect());
+        textNode->setColor(Qt::red);
+        textNode->addTextLayout({10, 10}, &textLayout);
     }
 
+
+
+
+
     return node;
+}
+
+void MyCustomRenderNode::render(const QSGRenderNode::RenderState *state)
+{
+    // We can destroy the uploaded tiles
+    tileLoaderUploadResult.reset();
+
+    auto* cb = commandBuffer();
+
+    // The QQuickItem canvas has Y pointing down.
+    // The QRhi canvas is Y pointing up.
+    // We need to fix.
+
+    auto pixelRatio = renderTarget()->devicePixelRatio();
+    auto renderTargetSize = renderTarget()->pixelSize().toSizeF();
+
+    // Pretty sure accessing the widget is a race condition.
+    auto x = sourceWidget->x() * pixelRatio;
+    auto y = sourceWidget->y() * pixelRatio;
+    auto width = sourceWidget->width() * pixelRatio;
+    auto height = sourceWidget->height() * pixelRatio;
+    // Adjust Y coordinate to account for the inverted Y-axis
+    float invertedY = renderTargetSize.height() - (y + height);
+
+    // Use the adjusted Y coordinate for rendering
+    cb->setViewport({
+        (float)x,
+        (float)invertedY,
+        (float)width,
+        (float)height
+    });
+
+    {
+        // Render background
+        cb->setGraphicsPipeline(backgroundRhi.pipeline);
+        cb->setShaderResources();
+        cb->draw(4);
+    }
+
+    cb->setGraphicsPipeline(m_pipeline);
+
+    // For some reason, Vulkan requires
+    // that the set pipeline uses scissor
+    // in order for us to set it.
+    cb->setScissor(QRhiScissor{
+        (int)x,
+        (int)invertedY,
+        (int)width,
+        (int)height
+    });
+
+    for (int i = 0; i < m_drawCmds.size(); i++) {
+        auto const& drawCmd = m_drawCmds[i];
+
+        auto dynOffset = QRhiCommandBuffer::DynamicOffset(0, sizeof(UniformType) * i );
+        cb->setShaderResources(m_resourceBindings, 1, &dynOffset);
+
+        QRhiCommandBuffer::VertexInput vertexInputs[] = { {
+            drawCmd.vtxBuffer,
+            drawCmd.vtxByteOffset } };
+
+        cb->setVertexInput(
+            0,
+            1,
+            vertexInputs,
+            drawCmd.idxBuffer,
+            drawCmd.idxByteOffset,
+            QRhiCommandBuffer::IndexUInt32);
+
+        cb->drawIndexed(drawCmd.idxCount, 1, 0, 0, 0);
+    }
 }
 
 void MyCustomRenderNode::loadBackgroundShader(QRhi* rhi) {
@@ -645,6 +567,13 @@ void MyCustomRenderNode::loadFillShader(QRhi* rhi) {
 
     QRhiGraphicsPipeline::TargetBlend blend = {};
     blend.enable = true;
+    blend.opColor = QRhiGraphicsPipeline::Add;
+    blend.opAlpha = QRhiGraphicsPipeline::Add;
+    blend.srcAlpha = QRhiGraphicsPipeline::One;
+    blend.dstAlpha = QRhiGraphicsPipeline::One;
+    blend.srcColor = QRhiGraphicsPipeline::SrcAlpha;
+    blend.dstColor = QRhiGraphicsPipeline::OneMinusSrcAlpha;
+
     m_pipeline->setTargetBlends({ blend });
 
     m_pipeline->setShaderResourceBindings(m_resourceBindingsLayout);
@@ -662,130 +591,174 @@ void MyCustomRenderNode::loadFillShader(QRhi* rhi) {
     m_pipeline->create();
 }
 
-void MyCustomRenderNode::loadTile(
-    QRhi* rhi,
-    QRhiResourceUpdateBatch* batch)
+void MyCustomRenderNode::loadStyleSheet()
 {
-    QProtobufSerializer serializer;
-
-    QFile tileFile = { ":z0x0y0.mvt" };
-    tileFile.open(QFile::ReadOnly);
-    auto tileBytes = tileFile.readAll();
-
-    vector_tile::Tile tile;
-    tile.deserialize(&serializer, tileBytes);
-
-    if (serializer.deserializationError()!= QAbstractProtobufSerializer::NoError) {
-        qFatal("Couldn't deserialize");
-    }
-
-    for (auto const& inLayer : tile.layers()) {
-        Layer outLayer = {};
-
-        outLayer.name = inLayer.name();
-
-        for (auto const& inFeature : inLayer.features()) {
-            if (inFeature.type() != vector_tile::Tile::GeomType::POLYGON) {
-                continue;
-            }
-
-            Feature outFeature = {};
-
-            outFeature.metaData = populateFeatureMetaData(
-                inFeature.tags(),
-                inLayer.keys(),
-                inLayer.values());
-
-            auto decodedGeometry = ProtobufFeatureToPolygon(inFeature.geometry());
-
-            if (decodedGeometry.first.empty() || decodedGeometry.second.empty()) {
-                continue;
-            }
-
-            for (auto const& item : decodedGeometry.first) {
-                outFeature.vertices.push_back({(float)item.x, (float)item.y});
-            }
-            outFeature.indices = decodedGeometry.second;
-
-            auto vtxBuffer = rhi->newBuffer(
-                QRhiBuffer::Immutable,
-                QRhiBuffer::VertexBuffer,
-                outFeature.vertices.size() * sizeof(outFeature.vertices[0]));
-            if (!vtxBuffer->create()) {
-                qFatal("Failed to create tile vertex buffer");
-            }
-            batch->uploadStaticBuffer(
-                vtxBuffer,
-                outFeature.vertices.data());
-            outFeature.vertexBuffer = vtxBuffer;
-
-            auto idxBuffer = rhi->newBuffer(
-                QRhiBuffer::Immutable,
-                QRhiBuffer::IndexBuffer,
-                outFeature.indices.size() * sizeof(outFeature.indices[0]));
-            if (!idxBuffer->create()) {
-                qFatal("Failed to create tile vertex buffer");
-            }
-            batch->uploadStaticBuffer(
-                idxBuffer,
-                outFeature.indices.data());
-            outFeature.indexBuffer = idxBuffer;
-
-            outLayer.features.push_back(std::move(outFeature));
-        }
-
-        m_layers.push_back(std::move(outLayer));
-    }
-
-    auto stylesheet = StyleSheet::fromJsonFile(":/styleSheet.json").value();
+    auto stylesheet = StyleSheet::fromJsonFile(":/styleSheet-basic.json").value();
     m_styleSheet = std::move(stylesheet);
 }
 
-void MyCustomRenderNode::prepareDrawCommands() {
-    for (auto const& abstractLayerStylePtr : m_styleSheet.m_layerStyles) {
-        if (abstractLayerStylePtr->type() != StyleSheet::LayerType::fill) {
+void MyCustomRenderNode::prepareDrawCommands(
+    TileLoader* tileLoader,
+    glm::mat4 const& clipSpaceCorrection)
+{
+    m_uniforms.clear();
+    m_drawCmds.clear();
+
+    // TODO: Pretty sure this is a race condition.
+    double vpZoom = sourceWidget->getViewportZoom();
+    double width = sourceWidget->width();
+    double height = sourceWidget->height();
+    double aspect = width / height;
+    double vpX = sourceWidget->getViewportX();
+    double vpY = sourceWidget->getViewportY();
+    float vpRotation = (float)sourceWidget->getViewportRotation();
+
+    // This needs to be clamped based on the StyleSheeet min-max zoom?
+    auto mapZoom = (int)std::round(vpZoom);
+    mapZoom = std::clamp(mapZoom, 0, 15);
+
+    if (tileLoader == nullptr) {
+        return;
+    }
+
+    auto visibleCoords = calcVisibleTiles(
+        vpX,
+        vpY,
+        aspect,
+        vpZoom,
+        mapZoom);
+
+    // This is a memory leak.
+    auto* tileRequestResult = tileLoader->requestTiles(visibleCoords);
+    tileLoaderRequestResult.reset(tileRequestResult);
+
+    for (auto const tileCoord : visibleCoords) {
+        // Check if this tile-coord is loaded.
+        auto tileIt = tileRequestResult->tiles.find(tileCoord);
+        if (tileIt == tileRequestResult->tiles.end()) {
             continue;
         }
-        if (!isLayerShown(*abstractLayerStylePtr, 0)) {
-            continue;
-        }
+        auto const& tile = *tileIt->second;
 
-        auto const& fillLayerStyle = static_cast<FillLayerStyle const&>(*abstractLayerStylePtr);
-
-        // Find the tile-layer with this name.
-        std::optional<int> tileLayerIndex;
-        for (int i = 0; i < m_layers.size(); i++) {
-            if (abstractLayerStylePtr->m_sourceLayer == m_layers[i].name) {
-                tileLayerIndex = i;
-                break;
+        for (auto const& abstractLayerStylePtr : m_styleSheet.m_layerStyles) {
+            if (abstractLayerStylePtr->type() != StyleSheet::LayerType::fill) {
+                continue;
             }
-        }
-        if (!tileLayerIndex.has_value()) {
-            continue;
-        }
-        auto const& tileLayer = m_layers[tileLayerIndex.value()];
-
-        for (auto const& feature : tileLayer.features) {
-            if (!showFeature(fillLayerStyle, feature.metaData, 0, 0)) {
+            if (!isLayerShown(*abstractLayerStylePtr, mapZoom)) {
                 continue;
             }
 
-            auto color = fillLayerStyle.getFillColor(feature.metaData, 0, 0);
+            auto const& fillLayerStyle = static_cast<FillLayerStyle const&>(*abstractLayerStylePtr);
 
-            UniformType test = {};
-            test.color[0] = color.redF();
-            test.color[1] = color.greenF();
-            test.color[2] = color.blueF();
-            // TODO! There is a bug here!! Things are not being blended correctly!!
-            //test.color[3] = color.alphaF();
-            test.color[3] = 1;
-            m_uniforms.push_back(test);
+            // Find source layer in tile.
+            std::optional<int> tileLayerIndex;
+            for (int i = 0; i < tile.layers.size(); i++) {
+                if (abstractLayerStylePtr->m_sourceLayer == tile.layers[i].name) {
+                    tileLayerIndex = i;
+                    break;
+                }
+            }
+            if (!tileLayerIndex.has_value()) {
+                continue;
+            }
+            auto const& tileLayer = tile.layers[tileLayerIndex.value()];
 
-            DrawCmd cmd = {};
-            cmd.vtxBuffer = feature.vertexBuffer;
-            cmd.idxBuffer = feature.indexBuffer;
-            cmd.idxCount = feature.indices.size();
-            m_drawCmds.push_back(cmd);
+            for (auto const& feature : tileLayer.features) {
+                bool shouldShowFeature = showFeature(
+                    fillLayerStyle,
+                    Evaluator::FeatureGeometryType::Polygon,
+                    feature.metaData,
+                    mapZoom,
+                    vpZoom);
+                if (!shouldShowFeature) {
+                    continue;
+                }
+
+                auto color = fillLayerStyle.getFillColor(
+                    Evaluator::FeatureGeometryType::Polygon,
+                    feature.metaData,
+                    mapZoom,
+                    vpZoom);
+                auto translate = fillLayerStyle.getTranslation(
+                    feature.metaData,
+                    mapZoom,
+                    vpZoom);
+
+                UniformType test = {};
+                test.color[0] = color.redF();
+                //test.color[0] = 0;
+                test.color[1] = color.greenF();
+                //test.color[0] = 1;
+                test.color[2] = color.blueF();
+                //test.color[2] = 0;
+                // TODO! There is a bug here!! Things are not being blended correctly!!
+                test.color[3] = color.alphaF();
+
+                {
+                    auto quadScale = 1 / std::powf(2, mapZoom);
+
+                    auto mat = glm::mat4{ 1.f };
+
+                    // First we emplace the tile inside the quad that holds the worldmap
+                    mat = glm::scale(glm::mat4{1.f}, { quadScale, quadScale, 1 }) * mat;
+                    // Move origin to top left
+                    mat = glm::translate(glm::mat4{ 1.f }, glm::vec3{
+                        -(std::pow(2, mapZoom)-1) / 2,
+                        (std::pow(2, mapZoom)-1) / 2,
+                        0 } * quadScale) *
+                        mat;
+
+                    // Offset into the correct grid-cell for this tile.
+                    mat = glm::translate(glm::mat4{1.f},
+                        glm::vec3{ tileCoord.x, -tileCoord.y, 0 } * quadScale) *
+                        mat;
+
+                    // Position the world map relative to the viewport
+                    mat = glm::translate(glm::mat4{1.f}, { 0.5, -0.5, 0}) * mat;
+                    mat = glm::translate(glm::mat4{1.f}, {
+                        -vpX,
+                        vpY,
+                        0 }) *
+                        mat;
+
+                    mat = glm::rotate(glm::mat4{1.f},
+                        glm::radians(vpRotation),
+                        {0, 0, 1}) *
+                        mat;
+
+                    // Scale the quad according to viewport.
+                    mat = glm::scale(glm::mat4{1.f}, {
+                        std::pow(2, vpZoom),
+                        std::pow(2, vpZoom),
+                        1}) *
+                        mat;
+
+                    // So far, a tile has had the length of 1 and normalized coordinates of
+                    // [-0.5, 0.5]. NDC is range [-1, 1]. Adjust it to fill the range.
+                    mat = glm::scale(glm::mat4{1.f}, {2, 2, 1}) * mat;
+
+                    // Adjust for viewport aspect
+                    if (aspect < 1) {
+                        mat = glm::scale(glm::mat4{1.f}, { 1 / aspect, 1, 1}) * mat;
+                    } else {
+                        mat = glm::scale(glm::mat4{1.f}, { 1, aspect, 1}) * mat;
+                    }
+
+                    mat = clipSpaceCorrection * mat;
+
+                    memcpy(&test.matrix, &mat, sizeof(mat));
+                }
+
+                m_uniforms.push_back(test);
+
+                DrawCmd cmd = {};
+                cmd.vtxBuffer = tile.vertexBuffer.get();
+                cmd.vtxByteOffset = feature.vtxByteOffset;
+                cmd.idxBuffer = tile.indexBuffer.get();
+                cmd.idxByteOffset = feature.idxByteOffset;
+                cmd.idxCount = feature.idxCount;
+                m_drawCmds.push_back(cmd);
+            }
         }
     }
 }
@@ -809,6 +782,18 @@ void QQuickMap::mouseMoveEvent(QMouseEvent *event)
 
         // Calculate the difference between the current and original mouse position.
         QPointF diff = mouseCurrentPosition - mouseStartPosition;
+
+        // Rotate the new coordinates so that they're moving in our up-direction.
+        float angleRad = -glm::radians((float)getViewportRotation()); // Convert angle to radians if it's in degrees
+        glm::mat2 rotationMatrix = glm::mat2(
+            glm::vec2(cos(angleRad), -sin(angleRad)),
+            glm::vec2(sin(angleRad), cos(angleRad))
+            );
+        auto diffVec = rotationMatrix * glm::vec2{ diff.x(), diff.y() };
+        diff.setX(diffVec.x);
+        diff.setY(diffVec.y);
+
+
 
         // Scaling factor used when zooming.
         auto scalar = 1/(std::pow(2, getViewportZoom()));

@@ -4,7 +4,6 @@
 #ifndef EVALUATOR_H
 #define EVALUATOR_H
 
-// Qt header files.
 #include <QChar>
 #include <QJsonArray>
 #include <QMap>
@@ -14,67 +13,86 @@
 // Other header files.
 
 namespace Evaluator {
+    // This should probably be pulled into a different header entirely.
+    enum class FeatureGeometryType {
+        Point,
+        LineString,
+        Polygon,
+    };
+
     QVariant resolveExpression(
         const QJsonArray &expression,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomLevel);
+        int mapZoom,
+        float vpZoom);
 
     using ExpressionOpFnT = QVariant(*)(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
 
     QVariant all(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant case_(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant coalesce(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant compare(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant get(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant greater(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant has(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant in(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant interpolate(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
     QVariant match(
         const QJsonArray& array,
+        FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& metaData,
-        int mapZoomLevel,
-        float vpZoomeLevel);
+        int mapZoom,
+        float vpZoom);
 }
 #endif // EVALUATOR_H

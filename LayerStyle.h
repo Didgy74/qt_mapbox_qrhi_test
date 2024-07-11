@@ -16,6 +16,9 @@
 #include <QtTypes>
 #include <vector>
 #include <optional>
+#include <QVector2D>
+
+#include "Evaluator.h"
 
 class StyleSheet
 {
@@ -39,6 +42,9 @@ public:
         int m_maxZoom = 24;
         bool m_visibility;
         QJsonArray m_filter;
+
+    protected:
+        static void initAbstractMembers(AbstractLayerStyle& layer, const QJsonObject &json);
     };
 
     StyleSheet() = default;
@@ -73,18 +79,35 @@ public:
         return StyleSheet::LayerType::Background;
     }
 
-
     std::vector<std::pair<int, QColor>> colorStops;
     [[nodiscard]] QColor getColor(int mapZoom) const;
 };
 
-
 class FillLayerStyle : public StyleSheet::AbstractLayerStyle
 {
 private:
-    QVariant m_fillColor;
-    QVariant m_fillOpacity;
-    QVariant m_fillOutlineColor;
+    // A color can either be an object containing stops,
+    // or a regular color value?
+    // Nils chose not to use a QColor for this type
+    // because it was extremely annoying to debug
+    // when not able to read color-values.
+    std::vector<std::pair<int, std::array<float, 4>>> m_fillColorStops;
+    void loadFillColor(QJsonObject const& paintJson);
+
+    // The opacity can either be not present at all, in which case
+    // we use the default opacity set by the fill-color.
+    // Or it can be a single scalar value
+    // Or it can be a list of stops.
+    // Or it can be a full-blown expression.
+    bool m_opacityFound = false;
+    bool m_usingOpacityStops = true;
+    bool usingOpacityExpression() const { return !m_usingOpacityStops; }
+    QJsonArray m_opacityExpression;
+    std::vector<std::pair<int, float>> m_opacityStops;
+    void loadOpacity(QJsonObject const& paintJson);
+
+    // Measured in pixels
+    std::vector<std::pair<int, QVector2D>> m_translateStops;
 
 public:
     static std::unique_ptr<FillLayerStyle> fromJson(const QJsonObject &json);
@@ -95,9 +118,16 @@ public:
     }
 
     QColor getFillColor(
+        Evaluator::FeatureGeometryType featGeomType,
         const std::map<QString, QVariant>& featureMetaData,
         int mapZoom,
         double vpZoom) const;
+    QVector2D getTranslation(
+        const std::map<QString, QVariant>& featureMetaData,
+        int mapZoom,
+        double vpZoom) const;
+
+
 };
 
 class NotImplementedStyle : public StyleSheet::AbstractLayerStyle

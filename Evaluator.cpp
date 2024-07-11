@@ -3,15 +3,33 @@
 
 #include "Evaluator.h"
 
+QString toString(Evaluator::FeatureGeometryType geomType) {
+    switch (geomType) {
+    case Evaluator::FeatureGeometryType::Polygon:
+        return "Polygon";
+    case Evaluator::FeatureGeometryType::Point:
+        return "Point";
+    case Evaluator::FeatureGeometryType::LineString:
+        return "LineString";
+    }
+
+    qFatal("");
+    return "";
+}
+
 Evaluator::ExpressionOpFnT getExpressonFunction(const QString& op) {
     using namespace Evaluator;
+    if (op == "all") { return all; }
     if (op == "==") { return compare; }
     if (op == "!=") { return compare; }
+    if (op == "get") { return get; }
     if (op == "in") { return in; }
+    if (op == "match") { return match; }
+
     /*
 
 
-    if (op == "all") { return all; }
+
     if (op == "case") { return case_; }
     if (op == "coalesce") { return coalesce; }
     if (op == "get") { return get; }
@@ -26,9 +44,10 @@ Evaluator::ExpressionOpFnT getExpressonFunction(const QString& op) {
 
 QVariant Evaluator::resolveExpression(
     const QJsonArray &expression,
+    FeatureGeometryType featGeomType,
     const std::map<QString, QVariant>& metaData,
-    int mapZoomLevel,
-    float vpZoomLevel)
+    int mapZoom,
+    float vpZoom)
 {
     // Check for valid expression.
     if (expression.empty()) {
@@ -52,69 +71,137 @@ QVariant Evaluator::resolveExpression(
         qFatal("");
         return {};
     }
-    return opFn(expression, metaData, mapZoomLevel, vpZoomLevel);
+    return opFn(expression, featGeomType, metaData, mapZoom, vpZoom);
 
     // Return an invalid QVariant in case the expression was invalid or not supported.
     qFatal("");
     return {};
 }
 
-QVariant Evaluator::compare(
-    const QJsonArray &array,
+QVariant Evaluator::all(
+    const QJsonArray& array,
+    FeatureGeometryType featGeomType,
     const std::map<QString, QVariant>& metaData,
-    int mapZoomLevel,
-    float vpZoomLevel)
+    int mapZoom,
+    float vpZoom)
+{
+    // Loop over all the expressions and check that they evaluate to true.
+    // We skip the first element because it just
+    // holds the 'all' keyword.
+    for (int i = 1; i < array.size(); i++) {
+        auto const& jsonVal = array[i];
+        if (!jsonVal.isArray()) {
+            // The JSON val needs to be an expression.
+            qFatal("");
+        }
+        auto const& exprJsonArr = jsonVal.toArray();
+
+
+        auto exprResult = resolveExpression(
+            exprJsonArr,
+            featGeomType,
+            metaData,
+            mapZoom,
+            vpZoom);
+        if (exprResult.typeId() != QMetaType::Bool) {
+            // Expression has to return a bool result.
+            qFatal("");
+        }
+
+        if (!exprResult.toBool()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QVariant Evaluator::compare(
+    const QJsonArray& array,
+    FeatureGeometryType featGeomType,
+    const std::map<QString, QVariant>& metaData,
+    int mapZoom,
+    float vpZoom)
 {
     if (array.size() != 3) {
         qFatal("");
         return {};
     }
 
-    QVariant operand1;
-    QVariant operand2;
+    auto const& opObj = array[0];
+    if (!opObj.isString()) {
+        qFatal("");
+    }
+    auto const& op = opObj.toString();
 
-    if (array.at(1).isArray()) {
-        // Check if the operation opperand is a simple value or an expression in itself
-        // that will need resolving to extract the value.
-        static QJsonArray operand1Arr = array.at(1).toArray();
-        QString temp = resolveExpression(
-           operand1Arr,
-           metaData,
-           mapZoomLevel,
-           vpZoomLevel).toString();
-        if (temp == "$type") {
-            qFatal("Bleh");
-            return {};
-            // "type" is not a part of the feature's metadata so it is a special case.
-            //operand1 = getType(feature);
-        }
-        else {
-            auto tempValueIt = metaData.find(temp);
-            operand1 = tempValueIt != metaData.end() ? tempValueIt->second : QVariant();
+    QVariant operandLeft;
+
+    // Set the first operand
+    auto const& leftObj = array[1];
+    if (leftObj.isArray()) {
+        // Resolve the expression
+        auto const& arr = leftObj.toArray();
+    } else if (leftObj.isString()) {
+        auto const& keyword = leftObj.toString();
+
+        // $type is some kind of weird keyword.
+        // It's similar to the geometry-type keyword?
+        if (keyword == "$type") {
+            operandLeft = toString(featGeomType);
+        } else {
+            auto const& metaDataValueIt = metaData.find(keyword);
+            if (metaDataValueIt == metaData.end()) {
+                operandLeft = "";
+            } else {
+                operandLeft = metaDataValueIt->second;
+            }
         }
     } else {
-        QString temp = array.at(1).toString();
-        if (temp == "$type") {
-            qFatal("Bleh");
-            return {};
-            // Type is not a part of the feature's metadata so it is a special case.
-            //operand1 = getType(feature);
-        } else {
-            auto tempValueIt = metaData.find(temp);
-            operand1 = tempValueIt != metaData.end() ? tempValueIt->second : QVariant();
-        }
+        qFatal("");
     }
 
-    operand2 = array.at(2).toVariant();
-    //Check which operation this expression contains, and return the result of the comparison.
-    if(array.at(0).toString() == "!=")
-        return operand1 != operand2;
-    else
-        return operand1 == operand2;
+    QVariant operandRight = array[2].toVariant();
+
+    if (op == "==") {
+        return operandLeft == operandRight;
+    } else if (op == "!=") {
+        return operandLeft != operandRight;
+    } else {
+        qFatal("");
+        return {};
+    }
+}
+
+QVariant Evaluator::get(
+    QJsonArray const& exprJsonArr,
+    FeatureGeometryType featGeomType,
+    std::map<QString, QVariant> const& metaData,
+    int mapZoom,
+    float vpZoom)
+{
+    if (exprJsonArr.size() != 2) {
+        qFatal("");
+    }
+
+    auto const& propertyJsonVal = exprJsonArr[1];
+    if (!propertyJsonVal.isString()) {
+        // For now only strings are supported.
+        qFatal("");
+    }
+
+    auto const& property = propertyJsonVal.toString();
+
+    auto const& valueIt = metaData.find(property);
+    if (valueIt != metaData.end()) {
+        return valueIt->second;
+    }
+    else {
+        return {};
+    }
 }
 
 QVariant Evaluator::in(
     const QJsonArray &array,
+    FeatureGeometryType featGeomType,
     const std::map<QString, QVariant>& metaData,
     int mapZoomLevel,
     float vpZoomLevel)
@@ -136,23 +223,54 @@ QVariant Evaluator::in(
     return temp;
 }
 
-/*
-QVariant Evaluator::get(
-    const QJsonArray& array,
-    const std::map<QString, QVariant>& metaData,
-    int mapZoomLevel,
-    float vpZoomLevel)
+QVariant Evaluator::match(
+    QJsonArray const& exprJsonArray,
+    FeatureGeometryType featGeomType,
+    std::map<QString, QVariant> const& metaData,
+    int mapZoom,
+    float vpZoom)
 {
-    QString property = array.at(1).toString();
-    auto valueIt = metaData.find(property);
-    if (valueIt != metaData.end()) {
-        return valueIt->second;
+    if (exprJsonArray.size() < 4) {
+        qFatal("");
     }
-    else {
-        return {};
+
+    // Extract the label to be used for the checks.
+    auto const& labelJsonVal = exprJsonArray[1];
+    if (!labelJsonVal.isArray()) {
+        // For now we always assume this is a expression.
+        qFatal("");
     }
+    auto const& labelJsonExpr = labelJsonVal.toArray();
+
+    QVariant input = resolveExpression(
+        labelJsonExpr,
+        featGeomType,
+        metaData,
+        mapZoom,
+        vpZoom);
+
+    if (input.isValid()) {
+        for (int i = 2; i < exprJsonArray.size() - 1; i += 2) {
+            auto const& itemJsonVal = exprJsonArray[i];
+            QVariant item;
+            if (itemJsonVal.isArray()) {
+                // The item could either be an expression or a list of items...
+                auto const& itemJsonArr = itemJsonVal.toArray();
+                item = resolveExpression(itemJsonArr, featGeomType, metaData, mapZoom, vpZoom);
+            } else {
+                item = itemJsonVal.toVariant();
+            }
+
+            if (input == item)
+                return item;
+        }
+    }
+
+    // If the loop ends without returning, return the fallback value at index n.
+    return exprJsonArray.last().toVariant();
 }
 
+/*
 QVariant Evaluator::has(
     const QJsonArray &array,
     const std::map<QString, QVariant>& metaData,
@@ -200,27 +318,7 @@ QVariant Evaluator::greater(
         return operand1.toDouble() > operand2.toDouble();
 }
 
-QVariant Evaluator::all(
-    const QJsonArray &array,
-    const QMap<QString, QVariant>& metaData,
-    int mapZoomLevel,
-    float vpZoomLevel)
-{
-    // Loop over all the expressions and check that they evaluate to true.
-    for (int i = 1; i <= array.size() - 1; i++){
-        QJsonArray expressionArray = array.at(i).toArray();
-        bool matches = !resolveExpression(
-            expressionArray,
-            metaData,
-            mapZoomLevel,
-            vpZoomLevel)
-            .toBool();
-        if (matches) {
-            return false;
-        }
-    }
-    return true;
-}
+
 
 QVariant Evaluator::case_(
     const QJsonArray &array,
@@ -263,42 +361,6 @@ QVariant Evaluator::coalesce(
         }
     }
     return {};
-}
-
-QVariant Evaluator::match(
-    const QJsonArray &array,
-    const QMap<QString, QVariant>& metaData,
-    int mapZoomLevel,
-    float vpZoomLevel)
-{
-    // Extract the label to be used for the checks.
-    QJsonArray expression = array.at(1).toArray();
-    QVariant input = resolveExpression(
-        expression,
-        metaData,
-        mapZoomLevel,
-        vpZoomLevel);
-
-    // Loop over the array checking which value matches the input and return its corresponding output.
-    // The elements from 2 to n-2 are looped over because the first two elements contain the expression keyword and
-    // the operation label, and the last element contains the fallback value.
-    for (int i = 2; i < array.size() - 2; i += 2) {
-        if (array.at(i).isArray()) {
-            if (array.at(i).toArray().toVariantList().contains(input)) {
-                if (array.at(i + 1).isArray())
-                    return resolveExpression(array.at(i + 1).toArray(), metaData, mapZoomLevel, vpZoomLevel);
-                else
-                    return array.at(i + 1).toVariant();      
-            }
-        } else if (input == array.at(i).toVariant()) {
-            if(array.at(i + 1).isArray())
-                return resolveExpression(array.at(i + 1).toArray(), metaData, mapZoomLevel, vpZoomLevel);
-            else
-                return array.at(i + 1).toVariant();
-        }
-    }
-    // If the loop ends without returning, return the fallback value at index n.
-    return array.last().toVariant();
 }
 
 static float lerp(QPair<float, float> stop1, QPair<float, float> stop2, int currentZoom)

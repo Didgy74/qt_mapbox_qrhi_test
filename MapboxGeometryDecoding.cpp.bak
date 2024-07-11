@@ -1,0 +1,202 @@
+#include "MapboxGeometryDecoding.h"
+
+#include <QScopeGuard>
+
+#include "CDT.h"
+
+static qint32 decodeZigZag(qint32 input) {
+    return (input >> 1) ^ -(input & 1);
+}
+
+// Having an enum helps with debugging.
+enum class MapboxGeometryCommandId : quint32 {
+    MoveTo = 1,
+    LineTo = 2,
+    ClosePath = 7,
+};
+
+static bool isValidCommandId(MapboxGeometryCommandId commandId, quint32 count) {
+    if (commandId != MapboxGeometryCommandId::MoveTo &&
+        commandId != MapboxGeometryCommandId::LineTo &&
+        commandId != MapboxGeometryCommandId::ClosePath)
+    {
+        return false;
+    }
+    if (commandId == MapboxGeometryCommandId::LineTo && count == 0) {
+        return false;
+    }
+    if (commandId == MapboxGeometryCommandId::MoveTo && count != 1) {
+        return false;
+    }
+    if (commandId == MapboxGeometryCommandId::ClosePath && count != 1) {
+        return false;
+    }
+    return true;
+};
+
+static int calcIncrementCount(MapboxGeometryCommandId commandId, int repeatCount) {
+    int amountToIncrement = 1;
+    if (commandId == MapboxGeometryCommandId::LineTo || commandId == MapboxGeometryCommandId::MoveTo) {
+        amountToIncrement += repeatCount * 2;
+    }
+    return amountToIncrement;
+}
+
+struct Pointi32 {
+    qint32 x;
+    qint32 y;
+};
+std::optional<ProtobufFeatureToPolygon_ResultT> ProtobufFeatureToPolygon(
+    QSpan<unsigned int const> encodedGeometry)
+{
+    qint32 penX = {};
+    qint32 penY = {};
+
+    int cursor = 0;
+    int lastPathStartIndex = 0;
+    auto lastCommandId = MapboxGeometryCommandId::ClosePath;
+
+    std::vector<Pointi32> pointList{};
+    // We need to track all boundary line-segments forming this path
+    // so that we may triangulate the path later.
+    std::vector<CDT::Edge> boundaryEdges;
+
+    while (cursor < encodedGeometry.size()) {
+        int commandIndex = cursor;
+        int encodedCommandInteger = encodedGeometry[commandIndex];
+        auto commandId = MapboxGeometryCommandId(encodedCommandInteger & 0x7);
+        int repeatCount = encodedCommandInteger >> 3;
+        if (!isValidCommandId(commandId, repeatCount)) {
+            qFatal("Failure during geometry decoding");
+        }
+        /*
+        if (commandId == MapboxGeometryCommandId::MoveTo &&
+            lastCommandId != MapboxGeometryCommandId::ClosePath)
+        {
+            // There is an edge-case where the data will manually add a line back to the
+            // first position, and omit the "ClosePath" command. Here
+            // we detect this event, remove the final element and close the path.
+            if (!pointList.empty()) {
+                auto lastPoint = pointList.back();
+                auto firstPoint = pointList[lastPathStartIndex];
+                if (lastPoint.x == firstPoint.x && lastPoint.y == firstPoint.y) {
+                    pointList.pop_back();
+                    boundaryEdges.pop_back();
+                    boundaryEdges.push_back({
+                        (unsigned int)pointList.size() - 1,
+                        (unsigned int)lastPathStartIndex });
+                    lastPathStartIndex = pointList.size();
+                } else {
+
+                    // In this case we should close the path,
+                    // but the commands didn't do it for us.
+                    boundaryEdges.push_back({
+                        (unsigned int)pointList.size() - 1,
+                        (unsigned int)lastPathStartIndex });
+                    lastPathStartIndex = pointList.size();
+                }
+            } else {
+                qFatal("Unhandled edge case");
+            }
+        }
+        */
+
+        // If the first command is NOT a move-to command, we need to start
+        // by inserting a point at the origin.
+        // This basically never happens with most data???
+        if (pointList.size() == lastPathStartIndex && commandId != MapboxGeometryCommandId::MoveTo) {
+            pointList.push_back({});
+            qFatal("Untested");
+        }
+
+        // Calculate how much we need to increment
+        // to find the next command integer. Then apply it
+        // deferredly.
+        int amountToIncrement = calcIncrementCount(commandId, repeatCount);
+        if (commandIndex + amountToIncrement > encodedGeometry.size()) {
+            qFatal("Invalid geometry stream");
+        }
+        QScopeGuard incrementor{ [&]() {
+            lastCommandId = commandId;
+            cursor += amountToIncrement;
+        }};
+
+
+        // Perform the command.
+        if (commandId == MapboxGeometryCommandId::ClosePath) {
+            // Reuse the first point of this path.
+            boundaryEdges.push_back({
+                (unsigned int)pointList.size() - 1,
+                (unsigned int)lastPathStartIndex });
+
+            lastPathStartIndex = pointList.size();
+        } else {
+            for (int repeatTracker = 0; repeatTracker < repeatCount; repeatTracker++) {
+                auto pointIndex = (commandIndex + 1) + (2 * repeatTracker);
+                auto diffX = decodeZigZag(encodedGeometry[pointIndex]);
+                auto diffY = decodeZigZag(encodedGeometry[pointIndex + 1]);
+                if (diffX == 0 && diffY == 0) {
+                    // Indicative of duplicate point.
+                    qFatal("");
+                }
+                penX += diffX;
+                penY += diffY;
+
+                if (commandId == MapboxGeometryCommandId::MoveTo) {
+                    lastPathStartIndex = pointList.size();
+                    pointList.push_back({ penX, penY });
+                } else if (commandId == MapboxGeometryCommandId::LineTo) {
+                    // We can safely use size() - 1 because
+                    // we are guaranteed to have set the origin at the
+                    // pen position before this command comes.
+                    boundaryEdges.push_back({
+                        (unsigned int)pointList.size() - 1,
+                        (unsigned int)pointList.size() });
+                    pointList.push_back({ penX, penY });
+                }
+            }
+        }
+    }
+    if (lastCommandId != MapboxGeometryCommandId::ClosePath) {
+        qFatal("Error");
+    }
+
+    // Triangulate our polygon.
+    // This lib may throw sometimes, idk why
+    CDT::Triangulation<float> cdt;
+
+    // Turn out pointList into what CDT expects.
+    std::vector<CDT::V2d<float>> cdtPointList;
+    for (auto const& item : pointList) {
+        cdtPointList.push_back({ (float)item.x, (float)item.y });
+    }
+
+    CDT::RemoveDuplicatesAndRemapEdges(cdtPointList, boundaryEdges);
+    cdt.insertVertices(cdtPointList);
+    cdt.insertEdges(boundaryEdges);
+
+    cdt.eraseOuterTrianglesAndHoles();
+    if (!cdt.isFinalized()) {
+        qFatal("Triangulation failure.");
+    }
+    auto const& verts = cdt.vertices;
+    auto const& triangles = cdt.triangles;
+
+    if (verts.empty() || triangles.empty()) {
+        return std::nullopt;
+    }
+
+    std::vector<QVector2D> vertexBuffer;
+    for (auto const& item : verts) {
+        vertexBuffer.push_back({ item.x, item.y });
+    }
+
+    std::vector<qint32> indexBuffer{};
+    for (auto const& item : triangles) {
+        indexBuffer.push_back(item.vertices[0]);
+        indexBuffer.push_back(item.vertices[1]);
+        indexBuffer.push_back(item.vertices[2]);
+    }
+
+    return ProtobufFeatureToPolygon_ResultT{ vertexBuffer, indexBuffer };
+}

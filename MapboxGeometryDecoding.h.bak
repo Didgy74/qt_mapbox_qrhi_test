@@ -1,0 +1,18 @@
+#ifndef MAPBOXGEOMETRYDECODING_H
+#define MAPBOXGEOMETRYDECODING_H
+
+#include <QSpan>
+#include <QVector2D>
+
+#include <vector>
+#include <optional>
+
+struct ProtobufFeatureToPolygon_ResultT {
+    std::vector<QVector2D> vertices;
+    std::vector<qint32> indices;
+};
+
+std::optional<ProtobufFeatureToPolygon_ResultT> ProtobufFeatureToPolygon(
+    QSpan<unsigned int const> encodedGeometry);
+
+#endif // MAPBOXGEOMETRYDECODING_H

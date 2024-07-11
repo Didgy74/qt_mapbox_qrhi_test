@@ -13,7 +13,8 @@
 #include "Evaluator.h"
 
 // This function assumes the stops have already been sorted.
-QColor interpolateStops(QSpan<std::pair<int, QColor> const> list, int currentZoom)
+template<class T>
+T interpolateStops(QSpan<std::pair<int, T> const> list, int currentZoom)
 {
     if (list.empty()) {
         qFatal("");
@@ -79,7 +80,51 @@ static std::optional<QColor> parseColorFromString(QString colorString)
     }
 }
 
-std::unique_ptr<StyleSheet::AbstractLayerStyle> StyleSheet::AbstractLayerStyle::fromJson(const QJsonObject &json)
+void StyleSheet::AbstractLayerStyle::initAbstractMembers(
+    AbstractLayerStyle& layer,
+    const QJsonObject &json)
+{
+    layer.m_id = json.value("id").toString();
+    layer.m_source = json.value("source").toString();
+    layer.m_sourceLayer = json.value("source-layer").toString();
+    layer.m_minZoom = json.value("minzoom").toInt(0);
+    layer.m_maxZoom = json.value("maxzoom").toInt(24);
+
+    // If the layout object is not present, it means the
+    // layer defaults to being visible.
+
+    auto const& layoutRefIt = json.find("layout");
+    if (layoutRefIt == json.end()) {
+        layer.m_visibility = true;
+    } else {
+        if (!layoutRefIt->isObject()) {
+            qFatal("layout was present but not of type object");
+        }
+        auto const& layout = layoutRefIt->toObject();
+        auto const& visibilityRefIt = layout.find("visibility");
+        if (visibilityRefIt == layout.end()) {
+            layer.m_visibility = true;
+        } else {
+            if (!visibilityRefIt->isString()) {
+                qFatal("");
+            }
+            auto const& visibilityString = visibilityRefIt->toString();
+            if (visibilityString == "visible") {
+                layer.m_visibility = true;
+            } else if (visibilityString == "none") {
+                layer.m_visibility = false;
+            } else {
+                qFatal("");
+            }
+        }
+    }
+
+    if(json.contains("filter"))
+        layer.m_filter = json.value("filter").toArray();
+}
+
+std::unique_ptr<StyleSheet::AbstractLayerStyle>
+StyleSheet::AbstractLayerStyle::fromJson(const QJsonObject &json)
 {
     auto const& layerTypeIt = json.find("type");
     if (layerTypeIt == json.end()) {
@@ -92,6 +137,7 @@ std::unique_ptr<StyleSheet::AbstractLayerStyle> StyleSheet::AbstractLayerStyle::
     auto const& layerType = layerTypeRef.toString();
 
     std::unique_ptr<AbstractLayerStyle> returnLayerPtr;
+
     if (layerType == "background") {
         returnLayerPtr = BackgroundLayerStyle::fromJson(json);
     }
@@ -104,56 +150,29 @@ std::unique_ptr<StyleSheet::AbstractLayerStyle> StyleSheet::AbstractLayerStyle::
         returnLayerPtr = NotImplementedStyle::fromJson(json);
     else
         returnLayerPtr = NotImplementedStyle::fromJson(json);
-
-    // Set layer properties.
-    AbstractLayerStyle *newLayer = returnLayerPtr.get();
-    newLayer->m_id = json.value("id").toString();
-    newLayer->m_source = json.value("source").toString();
-    newLayer->m_sourceLayer = json.value("source-layer").toString();
-    newLayer->m_minZoom = json.value("minzoom").toInt(0);
-    newLayer->m_maxZoom = json.value("maxzoom").toInt(24);
-
-    auto const& layoutRefIt = json.find("layout");
-    if (layoutRefIt == json.end()) {
-        qFatal("");
-    }
-    if (!layoutRefIt->isObject()) {
-        qFatal("");
-    }
-    auto const& layout = layoutRefIt->toObject();
-    auto const& visibilityRefIt = layout.find("visibility");
-    if (visibilityRefIt == layout.end()) {
-        newLayer->m_visibility = true;
-    } else {
-        if (!visibilityRefIt->isString()) {
-            qFatal("");
-        }
-        auto const& visibilityString = visibilityRefIt->toString();
-        if (visibilityString == "visible") {
-            newLayer->m_visibility = true;
-        } else if (visibilityString == "none") {
-            newLayer->m_visibility = false;
-        } else {
-            qFatal("");
-        }
-    }
-
-    if(json.contains("filter"))
-        newLayer->m_filter = json.value("filter").toArray();
-
     return returnLayerPtr;
 }
 
-std::optional<StyleSheet> StyleSheet::fromJson(const QJsonDocument &styleSheetJson)
+std::optional<StyleSheet> StyleSheet::fromJson(const QJsonDocument &styleSheetJsonDoc)
 {
     StyleSheet out;
 
-    QJsonObject styleSheetObject = styleSheetJson.object();
-    out.m_id = styleSheetObject.value("id").toString();
-    out.m_version = styleSheetObject.value("version").toInt();
-    out.m_name = styleSheetObject.value("name").toString();
+    auto const& styleSheetJson = styleSheetJsonDoc.object();
+    out.m_id = styleSheetJson.value("id").toString();
+    out.m_version = styleSheetJson.value("version").toInt();
+    out.m_name = styleSheetJson.value("name").toString();
 
-    QJsonArray layers = styleSheetObject.value("layers").toArray();
+    auto const& layersIt = styleSheetJson.find("layers");
+    if (layersIt == styleSheetJson.end()) {
+        qFatal("Stylesheet is missing layers.");
+        return std::nullopt;
+    }
+    if (!layersIt->isArray()) {
+        qFatal("Stylesheet 'layer' property is not of type array.");
+        return std::nullopt;
+    }
+    auto const& layers = layersIt->toArray();
+
     for (const auto &layerRef : layers) {
         if (!layerRef.isObject()) {
             qFatal("Bleh");
@@ -189,7 +208,8 @@ std::optional<StyleSheet> StyleSheet::fromJsonFile(const QString& path)
 std::unique_ptr<BackgroundLayerStyle> BackgroundLayerStyle::fromJson(const QJsonObject &json)
 {
     auto returnLayerPtr = std::make_unique<BackgroundLayerStyle>();
-    auto* returnLayer = returnLayerPtr.get();
+    auto& returnLayer = *returnLayerPtr;
+    initAbstractMembers(returnLayer, json);
 
     auto const& paintJsonIt = json.find("paint");
     if (paintJsonIt == json.end()) {
@@ -204,45 +224,53 @@ std::unique_ptr<BackgroundLayerStyle> BackgroundLayerStyle::fromJson(const QJson
     if (colorIt == paintJson.end()) {
         qFatal("Backgrould layer member 'paint' does not contain background-color");
     }
-    if (!colorIt->isObject()) {
-        qFatal("Bleh");
-    }
-    auto const& color = colorIt->toObject();
-    auto const& colorStopsIt = color.find("stops");
-    if (colorStopsIt == color.end()) {
-        qFatal("Bleh");
-    }
-    if (!colorStopsIt->isArray()) {
-        qFatal("Bleh");
-    }
-    auto const& colorStops = colorStopsIt->toArray();
-    for (auto const& item : colorStops) {
-        if (!item.isArray()) {
+    if (colorIt->isObject()) {
+        auto const& color = colorIt->toObject();
+        auto const& colorStopsIt = color.find("stops");
+        if (colorStopsIt == color.end()) {
             qFatal("Bleh");
         }
-        auto const& stop = item.toArray();
-        if (stop.size() != 2) {
+        if (!colorStopsIt->isArray()) {
             qFatal("Bleh");
         }
-        std::pair<int, QColor> outStop;
-        auto const& stopIndex = stop[0];
-        if (!stopIndex.isDouble()) {
-            qFatal("Bleh");
-        }
-        outStop.first = stopIndex.toInt();
+        auto const& colorStops = colorStopsIt->toArray();
+        for (auto const& item : colorStops) {
+            if (!item.isArray()) {
+                qFatal("Bleh");
+            }
+            auto const& stop = item.toArray();
+            if (stop.size() != 2) {
+                qFatal("Bleh");
+            }
+            std::pair<int, QColor> outStop;
+            auto const& stopIndex = stop[0];
+            if (!stopIndex.isDouble()) {
+                qFatal("Bleh");
+            }
+            outStop.first = stopIndex.toInt();
 
-        // Parse the color
-        auto const& stopColor = stop[1];
-        if (!stopColor.isString()) {
-            qFatal("Bleh");
-        }
-        auto parsedColorOpt = parseColorFromString(stopColor.toString());
-        if (!parsedColorOpt.has_value() || !parsedColorOpt.value().isValid()) {
-            qFatal("Bleh");
-        }
-        outStop.second = parsedColorOpt.value();
+            // Parse the color
+            auto const& stopColor = stop[1];
+            if (!stopColor.isString()) {
+                qFatal("Bleh");
+            }
+            auto parsedColorOpt = parseColorFromString(stopColor.toString());
+            if (!parsedColorOpt.has_value() || !parsedColorOpt.value().isValid()) {
+                qFatal("Bleh");
+            }
+            outStop.second = parsedColorOpt.value();
 
-        returnLayer->colorStops.push_back(outStop);
+            returnLayer.colorStops.push_back(outStop);
+        }
+    } else if (colorIt->isString()) {
+        // Try to parse the string as a color.
+        auto parsedColorOpt = parseColorFromString(colorIt->toString());
+        if (!parsedColorOpt.has_value()) {
+            qFatal("Unable to parse background color from string.");
+        }
+        returnLayer.colorStops.push_back({0, parsedColorOpt.value()});
+    } else {
+        qFatal("Unknown background-color type.");
     }
 
     return returnLayerPtr;
@@ -252,101 +280,217 @@ QColor BackgroundLayerStyle::getColor(
     int mapZoom) const
 {
     return interpolateStops(
-        { colorStops.data(), (qsizetype)colorStops.size()},
+        QSpan{ colorStops.data(), (qsizetype)colorStops.size()},
         mapZoom);
 }
 
-std::unique_ptr<FillLayerStyle> FillLayerStyle::fromJson(const QJsonObject &jsonObj)
+void FillLayerStyle::loadFillColor(QJsonObject const& paintJson) {
+    auto const& jsonIt = paintJson.find("fill-color");
+    if (jsonIt == paintJson.end()) {
+        qFatal("Fill layer member 'paint' does not contain fill-color");
+    }
+    if (jsonIt->isObject()) {
+        // The opacity is expressed as an object containing stops.
+
+        auto const& json = jsonIt->toObject();
+        auto const& stopsIt = json.find("stops");
+        if (stopsIt == json.end()) {
+            qFatal("Bleh");
+        }
+        if (!stopsIt->isArray()) {
+            qFatal("Bleh");
+        }
+        auto const& stops = stopsIt->toArray();
+        for (auto const& stopJsonVal : stops) {
+            if (!stopJsonVal.isArray()) {
+                qFatal("Bleh");
+            }
+            auto const& stopJsonArr = stopJsonVal.toArray();
+            if (stopJsonArr.size() != 2) {
+                qFatal("Bleh");
+            }
+
+            std::pair<int, std::array<float, 4>> outStop;
+
+            auto const& stopIndex = stopJsonArr[0];
+            if (!stopIndex.isDouble()) {
+                qFatal("Bleh");
+            }
+            outStop.first = stopIndex.toInt();
+
+            // Parse the color
+            auto const& stopColor = stopJsonArr[1];
+            if (!stopColor.isString()) {
+                qFatal("Bleh");
+            }
+            auto parsedColorOpt = parseColorFromString(stopColor.toString());
+            if (!parsedColorOpt.has_value() || !parsedColorOpt.value().isValid()) {
+                qFatal("Bleh");
+            }
+            parsedColorOpt.value().getRgbF(
+                &outStop.second[0],
+                &outStop.second[1],
+                &outStop.second[2],
+                &outStop.second[3]);
+
+            m_fillColorStops.push_back(outStop);
+        }
+    } else if (jsonIt->isString()) {
+        // Try to parse the string as a color.
+        auto parsedColorOpt = parseColorFromString(jsonIt->toString());
+        if (!parsedColorOpt.has_value()) {
+            qFatal("Unable to parse background color from string.");
+        }
+        std::pair<int, std::array<float, 4>> outStop = { 0, { } };
+        parsedColorOpt.value().getRgbF(
+            &outStop.second[0],
+            &outStop.second[1],
+            &outStop.second[2],
+            &outStop.second[3]);
+
+        m_fillColorStops.push_back(outStop);
+    } else {
+        qFatal("Unknown color type.");
+    }
+}
+
+void FillLayerStyle::loadOpacity(QJsonObject const& paintJson) {
+    auto const& jsonIt = paintJson.find("fill-opacity");
+    if (jsonIt == paintJson.end()) {
+        // Since it's optional, we just insert the default value of one into the
+        // stops.
+        m_opacityFound = false;
+        return;
+    }
+
+    m_opacityFound = true;
+    if (jsonIt->isObject()) {
+        // The opacity is expressed as an object containing stops.
+
+        m_usingOpacityStops = true;
+
+        auto const& json = jsonIt->toObject();
+        auto const& stopsIt = json.find("stops");
+        if (stopsIt == json.end()) {
+            qFatal("Bleh");
+        }
+        if (!stopsIt->isArray()) {
+            qFatal("Bleh");
+        }
+        auto const& stops = stopsIt->toArray();
+        for (auto const& stopJsonVal : stops) {
+            if (!stopJsonVal.isArray()) {
+                qFatal("Bleh");
+            }
+            auto const& stopJsonArr = stopJsonVal.toArray();
+            if (stopJsonArr.size() != 2) {
+                qFatal("Bleh");
+            }
+
+            std::pair<int, float> outStop;
+
+            auto const& stopIndexJsonVal = stopJsonArr[0];
+            if (!stopIndexJsonVal.isDouble()) {
+                qFatal("Bleh");
+            }
+            outStop.first = stopIndexJsonVal.toInt();
+
+            // Parse the color
+            auto const& stopValueJsonVal = stopJsonArr[1];
+            if (!stopValueJsonVal.isDouble()) {
+                qFatal("Bleh");
+            }
+            outStop.second = stopValueJsonVal.toDouble();
+
+            m_opacityStops.push_back(outStop);
+        }
+    } else if (jsonIt->isDouble()) {
+        m_usingOpacityStops = true;
+        m_opacityStops.push_back({
+            0,
+            jsonIt->toDouble()});
+    } else if (jsonIt->isArray()){
+        // We expect this to be an expression. It should return a double with
+        // a default value of 1.
+
+        m_usingOpacityStops = false;
+
+        // We should ordinary validate that it's a valid expression
+        // that we can actually resolve.
+        m_opacityExpression = jsonIt->toArray();
+    }
+}
+
+std::unique_ptr<FillLayerStyle> FillLayerStyle::fromJson(const QJsonObject &json)
 {
-    std::unique_ptr<FillLayerStyle> returnLayerPtr = std::make_unique<FillLayerStyle>();
-    FillLayerStyle* returnLayer = returnLayerPtr.get();
+    auto returnLayerPtr = std::make_unique<FillLayerStyle>();
+    auto& layer = *returnLayerPtr;
+    initAbstractMembers(layer, json);
 
-    //Parsing layout properties.
-    QJsonObject layout = jsonObj.value("layout").toObject();
-    //visibility property is parsed in:
-    // AbstractLayerStyle* AbstractLayerStyle::fromJson(const QJsonObject &jsonObj)
+    auto const& paintJsonIt = json.find("paint");
+    if (paintJsonIt == json.end()) {
+        qFatal("Couldn't find paint object within background layer");
+    }
+    if (!paintJsonIt->isObject()) {
+        qFatal("Background layer property 'paint' is not an object");
+    }
+    auto const& paintJson = paintJsonIt->toObject();
 
-    //Parsing paint properties.
-    QJsonObject paint = jsonObj.value("paint").toObject();
+    layer.loadFillColor(paintJson);
 
-    // Get the antialiasing property from the style sheet or set it to true as a default.
-    /*
-    returnLayer->m_antialias = paint.contains("fill-antialias")
-                                   ? paint.value("fill-antialias").toBool() : true;
-    */
+    layer.loadOpacity(paintJson);
 
-    if (paint.contains("fill-color")) {
-        const QJsonValue& fillColor = paint.value("fill-color");
-        if (fillColor.isObject()) {
-            // Case where the property is an object that has "stops".
-            QList<QPair<int, QColor>> stops;
-            QJsonArray arr = fillColor.toObject().value("stops").toArray();
+    auto const& fillTranslateIt = paintJson.find("fill-translate");
+    if (fillTranslateIt == paintJson.end()) {
+        layer.m_translateStops.push_back({ 0, {} });
+    } else {
+        if (!fillTranslateIt->isObject()) {
+            qFatal("");
+        }
+        auto const& fillTranslate = fillTranslateIt->toObject();
 
-            // Loop over all stops and append a pair of <zoomStop, colorStop> data to `stops`.
-            for (QJsonValueConstRef stop : arr) {
-                int zoomStop = stop.toArray().first().toInt();
+        auto const& stopsIt = fillTranslate.find("stops");
+        if (stopsIt == fillTranslate.end()) {
+            qFatal("Bleh");
+        }
+        if (!stopsIt->isArray()) {
+            qFatal("Bleh");
+        }
+        auto const& stops = stopsIt->toArray();
+        for (auto const& item : stops) {
+            if (!item.isArray()) {
+                qFatal("Bleh");
+            }
+            auto const& stop = item.toArray();
+            if (stop.size() != 2) {
+                qFatal("Bleh");
+            }
+            std::pair<int, QVector2D> outStop;
+            auto const& stopIndex = stop[0];
+            if (!stopIndex.isDouble()) {
+                qFatal("Bleh");
+            }
+            outStop.first = stopIndex.toInt();
 
-                auto colorOpt = parseColorFromString(stop.toArray().last().toString());
-                if (!colorOpt.has_value()) {
+            // Parse the 2d vec
+            auto const& stopValue = stop[1];
+            if (!stopValue.isArray()) {
+                qFatal("Bleh");
+            }
+            auto const& stopValueArr = stopValue.toArray();
+            if (stopValueArr.size() != 2) {
+                qFatal("");
+            }
+            // Iterate over the array and grab the floats.)
+            for (int i = 0; i < stopValueArr.size(); i++) {
+                auto const& arrVal = stopValueArr[i];
+                if (!arrVal.isDouble()) {
                     qFatal("");
                 }
-                stops.append(QPair<int, QColor>(zoomStop, colorOpt.value()));
+                outStop.second[i] = arrVal.toDouble();
             }
-            returnLayer->m_fillColor.setValue(stops);
-        } else if (fillColor.isArray()) {
-            // Case where the property is an expression.
-            returnLayer->m_fillColor.setValue(fillColor.toArray());
-        } else {
-            // Case where the property is a color value.
-            auto colorOpt = parseColorFromString(fillColor.toString());
-            returnLayer->m_fillColor.setValue(colorOpt.value());
-        }
-    }
 
-    if (paint.contains("fill-opacity")) {
-        QJsonValue fillOpacity = paint.value("fill-opacity");
-        if (fillOpacity.isObject()) {
-            // Case where the property is an object that has "stops".
-            QList<QPair<int, float>> stops;
-            QJsonArray arr = fillOpacity.toObject().value("stops").toArray();
-
-            // Loop over all stops and append a pair of <zoomStop, opacityStop> to `stops`.
-            for (QJsonValueConstRef stop : arr) {
-                int zoomStop = stop.toArray().first().toInt();
-                float opacityStop = stop.toArray().last().toDouble();
-                stops.append(QPair<int, float>(zoomStop, opacityStop));
-            }
-            returnLayer->m_fillOpacity.setValue(stops);
-        } else if (fillOpacity.isArray()) {
-            // Case where the property is an expression.
-            returnLayer->m_fillOpacity.setValue(fillOpacity.toArray());
-        } else {
-            // Case where the property is a numeric value.
-            returnLayer->m_fillOpacity.setValue(fillOpacity.toDouble());
-        }
-    }
-
-    if (paint.contains("fill-outline-color")) {
-        QJsonValue fillOutlineColor = paint.value("fill-outline-color");
-        if (fillOutlineColor.isObject()) {
-            // Case where the property is an object that has "stops".
-            QList<QPair<int, QColor>> stops;
-            QJsonArray arr =fillOutlineColor.toObject().value("stops").toArray();
-
-            // Loop over all stops and append a pair of <zoomStop, colorStop> to `stops`.
-            for (QJsonValueConstRef stop: arr) {
-                int zoomStop = stop.toArray().first().toInt();
-
-                QColor colorStop = parseColorFromString(stop.toArray().last().toString()).value();
-                stops.append(QPair<int, QColor>(zoomStop, colorStop));
-            }
-            returnLayer->m_fillOutlineColor.setValue(stops);
-        } else if (fillOutlineColor.isArray()) {
-            // Case where the property is an expression.
-            returnLayer->m_fillOutlineColor.setValue(fillOutlineColor.toArray());
-        } else {
-            // Case where the property is a color value.
-            returnLayer->m_fillOutlineColor.setValue(parseColorFromString(fillOutlineColor.toString()).value());
+            layer.m_translateStops.push_back(outStop);
         }
     }
 
@@ -354,42 +498,59 @@ std::unique_ptr<FillLayerStyle> FillLayerStyle::fromJson(const QJsonObject &json
 }
 
 QColor FillLayerStyle::getFillColor(
+    Evaluator::FeatureGeometryType featGeomType,
     const std::map<QString, QVariant>& featureMetaData,
     int mapZoom,
     double vpZoom) const
 {
-    QVariant temp;
-    if (m_fillColor.isNull()) {
-        // This should be considered an error.
-        // The default color in case no color is provided by the style sheet.
-        temp = QColor(Qt::GlobalColor::black);
-    } else if (m_fillColor.typeId() != QMetaType::Type::QColor &&
-               m_fillColor.typeId() != QMetaType::Type::QJsonArray) {
-        QList<QPair<int, QColor>> stops = m_fillColor.value<QList<QPair<int, QColor>>>();
-        if (stops.size() == 0) {
-            temp = QColor(Qt::GlobalColor::black);
+    auto tempColor = interpolateStops(
+        QSpan{ m_fillColorStops.data(), (int)m_fillColorStops.size()},
+        mapZoom);
+
+
+    if (m_opacityFound) {
+        float opacity = 1;
+
+        if (m_usingOpacityStops) {
+            opacity = interpolateStops(
+                QSpan{ m_opacityStops.data(), (qsizetype)m_opacityStops.size()},
+                mapZoom);
         } else {
-            temp = QVariant(getStopOutput(stops, mapZoom));
+            auto const& expressionResult = Evaluator::resolveExpression(
+                m_opacityExpression,
+                featGeomType,
+                featureMetaData,
+                mapZoom,
+                vpZoom);
+            if (!expressionResult.isValid()) {
+                qFatal("");
+            }
+
+            if (expressionResult.typeId() == QMetaType::LongLong) {
+                opacity = (float)expressionResult.toLongLong();
+            } else {
+                qFatal("");
+            }
         }
-    } else {
-        temp = m_fillColor;
+
+        tempColor[3] = opacity;
     }
 
+    return QColor::fromRgbF(
+        tempColor[0],
+        tempColor[1],
+        tempColor[2],
+        tempColor[3]);
+}
 
-    QVariant colorVariant = temp;
-    QColor color;
-    // The layer style might return an expression, that must be resolved.
-    if (colorVariant.typeId() == QMetaType::Type::QJsonArray){
-        color = Evaluator::resolveExpression(
-            colorVariant.toJsonArray(),
-            featureMetaData,
-            mapZoom,
-            vpZoom)
-            .value<QColor>();
-    } else {
-        color = colorVariant.value<QColor>();
-    }
-    return color;
+QVector2D FillLayerStyle::getTranslation(
+    const std::map<QString, QVariant>& featureMetaData,
+    int mapZoom,
+    double vpZoom) const
+{
+    return interpolateStops(
+        QSpan{ m_translateStops.data(), (int)m_translateStops.size()},
+        mapZoom);
 }
 
 std::unique_ptr<NotImplementedStyle> NotImplementedStyle::fromJson(const QJsonObject &json)

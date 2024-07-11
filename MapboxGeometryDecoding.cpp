@@ -48,6 +48,7 @@ std::pair<std::vector<Point>, std::vector<qint32>> ProtobufFeatureToPolygon(
         // This basically never happens with most data???
         if (pointList.size() == lastPathStartIndex && commandId != moveToCommand) {
             pointList.push_back({});
+            qFatal("Untested");
         }
 
         // Calculate how much we need to increment
@@ -121,7 +122,6 @@ std::pair<std::vector<Point>, std::vector<qint32>> ProtobufFeatureToPolygon(
         indexBuffer.push_back(item.vertices[1]);
         indexBuffer.push_back(item.vertices[2]);
     }
-
 
     return std::make_pair(vertexBuffer, indexBuffer);
 }

@@ -1,30 +1,28 @@
 #version 450
 
+// Input data is roughly in range [0, 4096]
 layout(location = 0) in vec2 positionIn;
 
-layout(std140, binding = 0) uniform buf {
-    vec2 posOffset;
+layout(column_major, std140, binding = 0) uniform UniformBuff {
+    mat4 matrix;
     vec4 color;
 };
 
+layout(location = 0) out vec2 normalizedPos;
+
 void main() {
-    vec2 position = positionIn;
-    // Normalize
-    position /= 4096;
-    position.y = 1 - position.y;
-    position *= 2;
-    position -= 1;
+    vec2 pos2 = positionIn;
+    // Normalize to [0, 1]
+    pos2 /= 4096;
 
-    /*
-    // Flip vertically
+    normalizedPos = pos2;
 
+    // Flips vertically
+    pos2.y = 1 - pos2.y;
+    // Center the tile
+    pos2 -= 0.5;
 
-    // Reproject onto the [-1,1] canvas
-    position.x -= 0.5;
-    position.y -= 0.5;
-    position.x *= 2;
-    position.y *= 2;
-    */
+    vec4 pos4 = matrix * vec4(pos2, 0, 1);
 
-    gl_Position = vec4(position + posOffset, 0.1, 1.0);
+    gl_Position = vec4(pos4.xy, 0, 1);
 }
